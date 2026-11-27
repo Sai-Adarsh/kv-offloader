@@ -2,10 +2,15 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <vector>
+
+std::uint64_t page_checksum(std::span<const std::byte> bytes);
 
 class HostPage {
 public:
@@ -58,12 +63,14 @@ public:
     void release(std::size_t slot);
     std::size_t high_water_bytes() const { return next_slot_.load() * page_bytes_; }
     std::size_t reused_writes() const { return reused_writes_.load(); }
+    std::uint64_t integrity_failures() const { return integrity_failures_.load(); }
 
 private:
     std::size_t page_bytes_;
-    std::size_t capacity_;
     std::atomic_size_t next_slot_{0};
     std::atomic_size_t reused_writes_{0};
+    std::atomic_uint64_t integrity_failures_{0};
+    std::vector<std::optional<std::uint64_t>> checksums_;
     std::vector<std::size_t> free_slots_;
     int fd_ = -1;
 };

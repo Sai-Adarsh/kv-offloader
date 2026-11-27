@@ -13,6 +13,7 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 
 namespace {
@@ -40,6 +41,14 @@ void check_cuda(cudaError_t result) {
 #endif
 
 }  // namespace
+
+std::uint64_t page_checksum(std::span<const std::byte> bytes) {
+    std::uint64_t sum = 14695981039346656037ull;
+    for (const std::byte byte : bytes) {
+        sum = (sum ^ std::to_integer<unsigned char>(byte)) * 1099511628211ull;
+    }
+    return sum;
+}
 
 HostPage::HostPage(std::size_t bytes) {
     void* allocation = nullptr;
@@ -153,11 +162,12 @@ void HotStorage::get(std::size_t slot, HostPage& host) {
 
 DiskStorage::DiskStorage(const std::filesystem::path& directory, std::size_t page_bytes,
                          std::size_t slots, bool direct)
-    : page_bytes_(page_bytes), capacity_(slots) {
+    : page_bytes_(page_bytes) {
     if (slots < 2 || page_bytes == 0) {
         throw std::invalid_argument("the spill file needs at least two nonempty slots");
     }
     (void)file_offset(slots - 1, page_bytes);
+    checksums_.resize(slots);
     free_slots_.reserve(slots);
     auto pattern = (directory / "kv-offloader-XXXXXX").string();
     fd_ = mkstemp(pattern.data());
@@ -186,7 +196,7 @@ DiskStorage::~DiskStorage() { close(fd_); }
 
 std::size_t DiskStorage::write(const HostPage& page) {
     const bool reuse = !free_slots_.empty();
-    if (!reuse && next_slot_.load() == capacity_) {
+    if (!reuse && next_slot_.load() == checksums_.size()) {
         throw std::runtime_error("spill file slot budget exhausted");
     }
     const auto slot = reuse ? free_slots_.back() : next_slot_.load();
@@ -201,17 +211,21 @@ std::size_t DiskStorage::write(const HostPage& page) {
     if (static_cast<std::size_t>(count) != page_bytes_) {
         throw std::runtime_error("short write to spill slot");
     }
-    if (free_slots_.empty()) {
-        ++next_slot_;
-    } else {
+    checksums_[slot] = page_checksum({page.data(), page_bytes_});
+    if (reuse) {
         free_slots_.pop_back();
         ++reused_writes_;
+    } else {
+        ++next_slot_;
     }
     return slot;
 }
 
 void DiskStorage::read(std::size_t slot, HostPage& page) {
     const auto offset = file_offset(slot, page_bytes_);
+    if (slot >= checksums_.size() || !checksums_[slot]) {
+        throw std::runtime_error("spill slot has no live page");
+    }
     ssize_t count = 0;
     do {
         count = pread(fd_, page.data(), page_bytes_, offset);
@@ -222,6 +236,16 @@ void DiskStorage::read(std::size_t slot, HostPage& page) {
     if (static_cast<std::size_t>(count) != page_bytes_) {
         throw std::runtime_error("short read from spill slot");
     }
+    if (page_checksum({page.data(), page_bytes_}) != *checksums_[slot]) {
+        ++integrity_failures_;
+        throw std::runtime_error("spill page checksum mismatch at slot " + std::to_string(slot));
+    }
 }
 
-void DiskStorage::release(std::size_t slot) { free_slots_.push_back(slot); }
+void DiskStorage::release(std::size_t slot) {
+    if (slot >= checksums_.size() || !checksums_[slot]) {
+        throw std::logic_error("cannot release an inactive spill slot");
+    }
+    checksums_[slot].reset();
+    free_slots_.push_back(slot);
+}

@@ -32,14 +32,6 @@ std::vector<std::byte> fixture(KvCache::BlockId id) {
     return result;
 }
 
-std::uint64_t checksum(const std::vector<std::byte>& payload) {
-    std::uint64_t value = 14695981039346656037ull;
-    for (const std::byte byte : payload) {
-        value = (value ^ std::to_integer<unsigned char>(byte)) * 1099511628211ull;
-    }
-    return value;
-}
-
 std::size_t count(std::string_view text, std::size_t minimum, std::size_t maximum) {
     std::size_t value = 0;
     const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
@@ -71,7 +63,7 @@ void churn(KvCache& cache, std::size_t disk_slots, std::size_t cycles) {
     const auto newest = active.back();
     auto pinned = cache.try_get(newest);
     if (!pinned || !cache.retire(newest).get() || cache.try_get(newest)
-        || cache.checksum(pinned).get() != checksum(fixture(newest))) {
+        || cache.checksum(pinned).get() != page_checksum(fixture(newest))) {
         throw std::runtime_error("retirement did not preserve an existing lease");
     }
     pinned.reset();
@@ -92,7 +84,7 @@ void churn(KvCache& cache, std::size_t disk_slots, std::size_t cycles) {
         const auto id = active.front();
         cache.prefetch(id).get();
         auto lease = cache.try_get(id);
-        if (!lease || cache.checksum(lease).get() != checksum(fixture(id)) || !cache.retire(id).get()) {
+        if (!lease || cache.checksum(lease).get() != page_checksum(fixture(id)) || !cache.retire(id).get()) {
             throw std::runtime_error("incorrect retired page during churn");
         }
         lease.reset();
@@ -109,7 +101,9 @@ void churn(KvCache& cache, std::size_t disk_slots, std::size_t cycles) {
               << " retired=" << stats.retired << " disk_pages=" << stats.disk_pages
               << " disk_slot_reuses=" << stats.disk_slot_reuses
               << " disk_high_water_bytes=" << stats.disk_high_water_bytes
-              << " disk_budget_bytes=" << disk_slots * page_bytes << " elapsed_ms=" << elapsed_ms
+              << " disk_budget_bytes=" << disk_slots * page_bytes
+              << " disk_integrity_failures=" << stats.disk_integrity_failures
+              << " elapsed_ms=" << elapsed_ms
               << " checksums_ok=true\n";
 }
 
@@ -170,7 +164,7 @@ int main(int argc, char** argv) try {
     const auto stop = std::chrono::steady_clock::now();
 
     const auto restored = cache.try_get(oldest_id);
-    if (!restored || cache.checksum(restored).get() != checksum(fixture(oldest_id))) {
+    if (!restored || cache.checksum(restored).get() != page_checksum(fixture(oldest_id))) {
         throw std::runtime_error("restored KV bytes differ from the spill");
     }
     const auto stats = cache.stats();
@@ -179,6 +173,7 @@ int main(int argc, char** argv) try {
               << " hot_misses=" << stats.hot_misses << " hot_to_host=" << stats.hot_to_host
               << " host_to_disk=" << stats.host_to_disk << " disk_to_host=" << stats.disk_to_host
               << " host_to_hot=" << stats.host_to_hot
+              << " disk_integrity_failures=" << stats.disk_integrity_failures
               << " resident_polls_during_restore=" << resident_polls
               << " prefetch_us=" << std::chrono::duration<double, std::micro>(stop - start).count()
               << " checksum_ok=true\n";
