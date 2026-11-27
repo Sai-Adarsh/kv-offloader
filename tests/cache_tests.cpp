@@ -124,6 +124,36 @@ void mismatched_transfer_pages(const std::filesystem::path& path) {
             "invalid transfer changed the disk page");
 }
 
+void hot_slot_ownership() {
+    HotStorage hot(2, bytes, false);
+    const auto first = hot.claim();
+    const auto second = hot.claim();
+    require(first != second, "two live claims share a slot");
+    hot.release(first);
+    rejects<std::logic_error>([&] { hot.release(first); }, "inactive hot slot");
+    rejects<std::logic_error>([&] { hot.release(2); }, "inactive hot slot");
+    require(hot.claim() == first, "failed release changed the reclaimed slot");
+    rejects<std::logic_error>([&] { hot.claim(); }, "no slot available");
+
+    HostPage buffer(bytes);
+    std::fill_n(buffer.data(), bytes, std::byte{19});
+    hot.put(second, buffer);
+    rejects<std::out_of_range>([&] { hot.data(2); }, "hot slot");
+    rejects<std::out_of_range>([&] { hot.put(2, buffer); }, "hot slot");
+    rejects<std::out_of_range>([&] { hot.get(2, buffer); }, "hot slot");
+    std::fill_n(buffer.data(), bytes, std::byte{0});
+    hot.get(second, buffer);
+    require(std::all_of(buffer.data(), buffer.data() + bytes, [](std::byte value) {
+        return value == std::byte{19};
+    }), "rejected operation changed a live slot");
+
+    rejects<std::invalid_argument>([] { HotStorage empty(0, bytes, false); }, "positive");
+    rejects<std::invalid_argument>([] { HotStorage empty(2, 0, false); }, "positive");
+    rejects<std::invalid_argument>([] {
+        HotStorage impossible(2, std::numeric_limits<std::size_t>::max() / 2 + 1, false);
+    }, "address space");
+}
+
 class FileSizeLimit {
 public:
     FileSizeLimit() {
@@ -322,6 +352,7 @@ int main() try {
     TempDir temp;
     slot_budget(temp.path);
     mismatched_transfer_pages(temp.path);
+    hot_slot_ownership();
     file_limit(temp.path);
     unreadable_spill(temp.path);
     failed_spill_promotion(temp.path);
