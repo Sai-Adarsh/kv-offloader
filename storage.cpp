@@ -234,6 +234,7 @@ void DiskStorage::read(std::size_t slot, HostPage& page) {
         throw std::system_error(errno, std::generic_category(), "read spill slot");
     }
     if (static_cast<std::size_t>(count) != page_bytes_) {
+        ++integrity_failures_;
         throw std::runtime_error("short read from spill slot");
     }
     if (page_checksum({page.data(), page_bytes_}) != *checksums_[slot]) {
