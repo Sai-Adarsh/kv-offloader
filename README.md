@@ -1,8 +1,8 @@
 # Hierarchical KV cache offloader
 
-This C++ cache spills fixed-size KV blocks from a hot pool to bounded host RAM and then to a temporary file. A FIFO worker handles transfers and reclamation. `try_get` only looks up resident blocks. `prefetch` returns a future for the transfer, and the resulting page lease pins its slot until the caller releases it. Hold the lease until device work using the page has completed.
+This C++ cache spills fixed-size KV blocks from a hot pool to bounded host RAM and then to a temporary file. A FIFO worker handles transfers and reclamation.
 
-## Build and run
+## Run the CPU demo
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -11,17 +11,29 @@ cmake --build build -j
 ./build/kv_offloader /tmp --disk-slots 4 --churn 256
 ```
 
-The short demo restores and verifies one spilled block. The churn run fills two hot slots, two host slots, and three disk slots with 64-KiB pages. It exercises disk pressure and verifies an existing lease after retirement and retirement submitted behind a queued restore. It then cycles through 256 restore, checksum, retire, and insert operations.
+The short demo restores and verifies one spilled block. The churn run fills two hot slots, two host slots, and three disk slots with 64-KiB pages. It checks disk pressure, lease validity after retirement, and retirement queued behind a restore. It then runs 256 cycles of restore, checksum, retire, and insert.
 
-On an Apple M3 Pro, the buffered run kept seven live blocks, reused 256 spill slots, and reached the 262,144-byte file budget. It reported zero integrity failures. The 256-cycle loop took 98.7 ms in this run, including fixture generation, checksums, and cache operations.
+### Recorded CPU churn
 
-## Retirement and disk slots
+The buffered run on an Apple M3 Pro kept seven live blocks, reused 256 spill slots, and reached the 262,144-byte file budget. It reported zero integrity failures. The 256-cycle loop took 98.7 ms, including fixture generation, checksums, and cache operations.
 
-`retire(id)` takes effect in worker submission order. After it completes, the ID leaves the cache and subsequent lookups miss. Earlier prefetches may complete before retirement. A pre-existing hot lease still reads the same bytes and keeps its slot allocated until the final holder releases it. Use a distinct ID for each block generation if an older operation may still be in flight.
+## Page lifetime
 
-The spill file reuses released slots and is bounded by `disk_slots × page_bytes`. The normal spill path keeps one slot available so that a full cache can restore a disk page without first overwriting it. The hot allocator reserves one extra physical page beyond its resident capacity to stage promotion before eviction. The worker copies the hot victim to host memory before consuming the disk scratch slot, and keeps the original disk page until it can publish the replacement. A failed copy or slot allocation therefore leaves the old page available and the disk scratch slot reusable. A new insert that needs another spill returns pressure once the normal budget is full. Outstanding leases can prevent eviction even after a block has been retired. File usage counts the highest successfully written offset, so reclaiming a slot can leave the file size unchanged.
+- `try_get` only looks up resident blocks. `prefetch` returns a future for the transfer. A page lease pins the slot until its last holder releases it. Hold the lease until device work using the page completes.
+- `retire(id)` takes effect in worker submission order. Earlier prefetches may complete first. Once retirement completes, lookups for the ID miss. Existing hot leases still read the same bytes, and outstanding leases can prevent eviction even after retirement.
+- Use a distinct ID for each block generation if an older operation may still be in flight.
 
-The worker records an in-memory FNV-1a checksum after a full disk write. A prefetch checks the bytes before eviction or publication. A short read or checksum mismatch fails the future and increments `disk_integrity_failures`. Read system-call errors propagate to the caller. The caller can retire the corrupt block and insert rebuilt KV bytes. The checksum adds one pass over each page on write and read and detects accidental corruption.
+### Capacity and promotion
+
+The spill file reuses released slots and is bounded by `disk_slots × page_bytes`. Normal spills leave one scratch slot free so a full cache can restore a disk page without overwriting it first. The hot pool reserves one extra physical page beyond its resident capacity to stage promotion before eviction.
+
+The worker copies the hot victim to host memory before using the disk scratch slot. It keeps the original disk page until it can publish the replacement. A failed copy or slot allocation leaves the old page available and the scratch slot reusable.
+
+When the normal spill budget is full, an insert that needs another spill returns pressure. File usage tracks the highest successfully written offset, so reclaiming a slot can leave file size unchanged.
+
+### Spill integrity
+
+The worker records an in-memory FNV-1a checksum after a full disk write. Prefetch verifies it before eviction or publication. A short read or checksum mismatch fails the future and increments `disk_integrity_failures`. Read system-call errors propagate to the caller. Retire a corrupt block and insert rebuilt KV bytes to recover. The checksum detects accidental corruption and adds one pass per page on write and on read.
 
 ## Run with CUDA VRAM and NVMe
 
@@ -31,19 +43,21 @@ cmake --build build-cuda -j
 ./build-cuda/kv_offloader /mnt/nvme --gpu --direct --churn 256
 ```
 
-CUDA allocates the hot pool and uses one pinned staging buffer on a dedicated stream. The worker synchronizes each copy before reusing the buffer. Linux `--direct` requests `O_DIRECT`, and macOS requests `F_NOCACHE`. Use a filesystem supporting the selected mode.
+CUDA allocates the hot pool and uses one pinned staging buffer on a dedicated stream. The worker synchronizes each copy before reusing the buffer. With `--direct`, Linux requests `O_DIRECT` and macOS requests `F_NOCACHE`. Use a filesystem that supports the selected mode.
 
-The CUDA/NVMe command has not been run. Real serving requires a scheduler that issues prefetches early and switches to ready sequences while cold pages load. The demo's resident polls are cache lookups; there is no model dispatch or measurement of decode latency.
+The CUDA/NVMe command has no recorded run. The demo polls resident blocks through cache lookups. Model dispatch and decode latency are outside those measurements. Serving requires a scheduler that issues prefetches early and switches to ready sequences while cold pages load.
 
 [CUDA runtime memory transfers](https://docs.nvidia.com/cuda/cuda-runtime-api/cuda-runtime-api/group__CUDART__MEMORY.html)
 
 ## Tests and coverage
 
-Tests exercise temporary-file spills, bounded slot reuse, queued retirement, old lease lifetime, and foreign-lease rejection. They truncate a page, force a read error, and flip one byte of a full page. A rejected promotion leaves the old hot page and the disk scratch slot available. The corruption case also verifies that retirement lets the slot hold valid data again. Direct I/O tests are opt-in.
+The tests cover temporary-file spills, bounded slot reuse, queued retirement, old lease lifetime, and foreign-lease rejection. Fault tests truncate a page, force a read error, and flip one byte of a full page. They verify that a rejected promotion leaves the old hot page and disk scratch slot available, and that retirement allows a corrupt slot to hold valid data again.
 
-Hot and spill transfers require a host buffer of exactly one configured page. The size check runs before copying bytes, changing slot state, or updating corruption counters.
+Hot and spill transfers require a host buffer of exactly one configured page. The size check runs before copying bytes, changing slot state, or updating corruption counters. Hot storage rejects duplicate releases, inactive slots, out-of-range indices, and overflowing allocation sizes. Keep a slot claimed while accessing its bytes.
 
-Hot storage rejects duplicate releases, inactive slots, out-of-range indices, and overflowing allocation sizes. Keep a slot claimed while accessing its bytes. A cache page lease keeps its slot claimed until the last lease ends, including after retirement.
+### Coverage command
+
+Direct I/O tests are opt-in. This command enables them.
 
 ```sh
 cmake -S . -B build/coverage -DCMAKE_BUILD_TYPE=Debug \
@@ -57,4 +71,6 @@ xcrun llvm-cov report build/coverage/kv_offloader \
   --show-branch-summary main.cpp cache.cpp cache.hpp storage.cpp storage.hpp
 ```
 
-On Linux, use `llvm-profdata` and `llvm-cov` from the same Clang toolchain without the `xcrun` prefix. The instrumented AppleClang CPU build with direct I/O enabled covered 599/619 lines (96.77%) and 166/200 branches (83.00%). It covered all 142 instrumented lines in `storage.cpp`. CUDA verification requires a separate build and an NVIDIA device.
+On Linux, use `llvm-profdata` and `llvm-cov` from the same Clang toolchain without the `xcrun` prefix.
+
+The recorded AppleClang CPU build with direct I/O enabled covered 599/619 lines (96.77%) and 166/200 branches (83.00%). It covered all 142 instrumented lines in `storage.cpp`. CUDA verification requires a separate build and an NVIDIA device.
