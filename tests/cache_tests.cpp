@@ -130,13 +130,16 @@ void hot_slot_ownership() {
     const auto second = hot.claim();
     require(first != second, "two live claims share a slot");
     hot.release(first);
+    HostPage buffer(bytes);
+    std::fill_n(buffer.data(), bytes, std::byte{19});
     rejects<std::logic_error>([&] { hot.release(first); }, "inactive hot slot");
     rejects<std::logic_error>([&] { hot.release(2); }, "inactive hot slot");
+    rejects<std::logic_error>([&] { hot.data(first); }, "inactive hot slot");
+    rejects<std::logic_error>([&] { hot.put(first, buffer); }, "inactive hot slot");
+    rejects<std::logic_error>([&] { hot.get(first, buffer); }, "inactive hot slot");
     require(hot.claim() == first, "failed release changed the reclaimed slot");
     rejects<std::logic_error>([&] { hot.claim(); }, "no slot available");
 
-    HostPage buffer(bytes);
-    std::fill_n(buffer.data(), bytes, std::byte{19});
     hot.put(second, buffer);
     rejects<std::out_of_range>([&] { hot.data(2); }, "hot slot");
     rejects<std::out_of_range>([&] { hot.put(2, buffer); }, "hot slot");

@@ -38,6 +38,16 @@ off_t file_offset(std::size_t slot, std::size_t bytes) {
     return static_cast<off_t>(slot * bytes);
 }
 
+std::size_t checked_hot_page_bytes(std::size_t capacity, std::size_t bytes) {
+    if (capacity == 0 || bytes == 0) {
+        throw std::invalid_argument("hot capacity and page size must be positive");
+    }
+    if (bytes > std::numeric_limits<std::size_t>::max() / capacity) {
+        throw std::invalid_argument("hot tier allocation would exceed address space");
+    }
+    return bytes;
+}
+
 #ifdef OFFLOADER_CUDA
 void check_cuda(cudaError_t result) {
     if (result != cudaSuccess) {
@@ -98,7 +108,8 @@ struct HotStorage::Cuda {
 #endif
 
 HotStorage::HotStorage(std::size_t capacity, std::size_t page_bytes, bool gpu)
-    : page_bytes_(page_bytes), gpu_(gpu), free_slots_(capacity) {
+    : page_bytes_(checked_hot_page_bytes(capacity, page_bytes)), gpu_(gpu),
+      free_slots_(capacity), claimed_(capacity) {
     std::iota(free_slots_.begin(), free_slots_.end(), 0);
     if (gpu_) {
 #ifdef OFFLOADER_CUDA
@@ -122,11 +133,16 @@ std::size_t HotStorage::claim() {
     }
     const auto slot = free_slots_.back();
     free_slots_.pop_back();
+    claimed_[slot].store(true, std::memory_order_relaxed);
     return slot;
 }
 
 void HotStorage::release(std::size_t slot) {
     const std::lock_guard guard(free_mutex_);
+    if (slot >= claimed_.size() || !claimed_[slot].load(std::memory_order_relaxed)) {
+        throw std::logic_error("cannot release an inactive hot slot");
+    }
+    claimed_[slot].store(false, std::memory_order_relaxed);
     free_slots_.push_back(slot);
 }
 
@@ -135,13 +151,22 @@ bool HotStorage::has_free_slot() {
     return !free_slots_.empty();
 }
 
-const std::byte* HotStorage::data(std::size_t slot) const {
+std::byte* HotStorage::address(std::size_t slot) const {
+    if (slot >= claimed_.size()) {
+        throw std::out_of_range("hot slot is out of range");
+    }
+    // A lease keeps the slot live. Checking it here does not take the allocator mutex.
+    if (!claimed_[slot].load(std::memory_order_relaxed)) {
+        throw std::logic_error("cannot access an inactive hot slot");
+    }
     return base_ + slot * page_bytes_;
 }
 
+const std::byte* HotStorage::data(std::size_t slot) const { return address(slot); }
+
 void HotStorage::put(std::size_t slot, const HostPage& host) {
     check_page_size(host, page_bytes_);
-    auto* destination = base_ + slot * page_bytes_;
+    auto* destination = address(slot);
 #ifdef OFFLOADER_CUDA
     if (gpu_) {
         std::memcpy(cuda_->staging, host.data(), page_bytes_);
@@ -156,16 +181,17 @@ void HotStorage::put(std::size_t slot, const HostPage& host) {
 
 void HotStorage::get(std::size_t slot, HostPage& host) {
     check_page_size(host, page_bytes_);
+    const auto* source = address(slot);
 #ifdef OFFLOADER_CUDA
     if (gpu_) {
-        check_cuda(cudaMemcpyAsync(cuda_->staging, data(slot), page_bytes_, cudaMemcpyDeviceToHost,
+        check_cuda(cudaMemcpyAsync(cuda_->staging, source, page_bytes_, cudaMemcpyDeviceToHost,
                                    cuda_->transfer));
         check_cuda(cudaStreamSynchronize(cuda_->transfer));
         std::memcpy(host.data(), cuda_->staging, page_bytes_);
         return;
     }
 #endif
-    std::memcpy(host.data(), data(slot), page_bytes_);
+    std::memcpy(host.data(), source, page_bytes_);
 }
 
 DiskStorage::DiskStorage(const std::filesystem::path& directory, std::size_t page_bytes,

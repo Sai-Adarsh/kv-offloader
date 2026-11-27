@@ -41,6 +41,8 @@ public:
     void get(std::size_t slot, HostPage& host);
 
 private:
+    std::byte* address(std::size_t slot) const;
+
     std::size_t page_bytes_;
     bool gpu_;
     std::vector<std::byte> ram_;
@@ -51,6 +53,7 @@ private:
 #endif
     std::mutex free_mutex_;
     std::vector<std::size_t> free_slots_;
+    std::vector<std::atomic_bool> claimed_;
 };
 
 class DiskStorage {
