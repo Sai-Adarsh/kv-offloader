@@ -43,6 +43,8 @@ Tests exercise temporary-file spills, bounded slot reuse, queued retirement, old
 
 Hot and spill transfers require a host buffer of exactly one configured page. The size check runs before copying bytes, changing slot state, or updating corruption counters.
 
+Hot storage rejects duplicate releases, inactive slots, out-of-range indices, and overflowing allocation sizes. Keep a slot claimed while accessing its bytes. A cache page lease keeps its slot claimed until the last lease ends, including after retirement.
+
 ```sh
 cmake -S . -B build/coverage -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping" -DKV_TEST_DIRECT_IO=ON

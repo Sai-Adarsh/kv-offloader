@@ -16,14 +16,6 @@ std::size_t nonzero(std::size_t value) {
     return value;
 }
 
-std::size_t checked_page_bytes(std::size_t bytes, std::size_t capacity) {
-    nonzero(bytes);
-    if (bytes > std::numeric_limits<std::size_t>::max() / capacity) {
-        throw std::invalid_argument("hot tier allocation would exceed address space");
-    }
-    return bytes;
-}
-
 std::size_t physical_hot_slots(std::size_t capacity) {
     if (capacity == std::numeric_limits<std::size_t>::max()) {
         throw std::invalid_argument("hot slot count leaves no room for a staging slot");
@@ -43,7 +35,7 @@ const std::byte* KvCache::Page::data() const { return storage_->data(slot_); }
 KvCache::KvCache(std::size_t hot_capacity, std::size_t host_capacity, std::size_t page_bytes,
                  const std::filesystem::path& spill_directory, bool gpu, bool direct, std::size_t disk_slots)
     : hot_capacity_(nonzero(hot_capacity)), host_capacity_(nonzero(host_capacity)),
-      page_bytes_(checked_page_bytes(page_bytes, physical_hot_slots(hot_capacity_))), disk_slots_(disk_slots),
+      page_bytes_(page_bytes), disk_slots_(disk_slots),
       hot_storage_(std::make_shared<HotStorage>(physical_hot_slots(hot_capacity_), page_bytes_, gpu)),
       disk_storage_(spill_directory, page_bytes_, disk_slots_, direct), worker_([this] { run(); }) {}
 
