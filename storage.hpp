@@ -19,8 +19,10 @@ public:
     HostPage(const HostPage&) = delete;
     HostPage& operator=(const HostPage&) = delete;
     std::byte* data() const { return data_; }
+    std::size_t size() const { return bytes_; }
 
 private:
+    std::size_t bytes_;
     std::byte* data_ = nullptr;
 };
 

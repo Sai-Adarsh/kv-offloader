@@ -24,6 +24,12 @@ void check_io(int result, const char* message) {
     }
 }
 
+void check_page_size(const HostPage& page, std::size_t page_bytes) {
+    if (page.size() != page_bytes) {
+        throw std::invalid_argument("host page size does not match storage page size");
+    }
+}
+
 off_t file_offset(std::size_t slot, std::size_t bytes) {
     const auto max_offset = static_cast<std::size_t>(std::numeric_limits<off_t>::max());
     if (bytes > max_offset || slot >= max_offset / bytes) {
@@ -50,7 +56,7 @@ std::uint64_t page_checksum(std::span<const std::byte> bytes) {
     return sum;
 }
 
-HostPage::HostPage(std::size_t bytes) {
+HostPage::HostPage(std::size_t bytes) : bytes_(bytes) {
     void* allocation = nullptr;
     const int status = posix_memalign(&allocation, 4096, bytes);
     if (status != 0) {
@@ -134,6 +140,7 @@ const std::byte* HotStorage::data(std::size_t slot) const {
 }
 
 void HotStorage::put(std::size_t slot, const HostPage& host) {
+    check_page_size(host, page_bytes_);
     auto* destination = base_ + slot * page_bytes_;
 #ifdef OFFLOADER_CUDA
     if (gpu_) {
@@ -148,6 +155,7 @@ void HotStorage::put(std::size_t slot, const HostPage& host) {
 }
 
 void HotStorage::get(std::size_t slot, HostPage& host) {
+    check_page_size(host, page_bytes_);
 #ifdef OFFLOADER_CUDA
     if (gpu_) {
         check_cuda(cudaMemcpyAsync(cuda_->staging, data(slot), page_bytes_, cudaMemcpyDeviceToHost,
@@ -195,6 +203,7 @@ DiskStorage::DiskStorage(const std::filesystem::path& directory, std::size_t pag
 DiskStorage::~DiskStorage() { close(fd_); }
 
 std::size_t DiskStorage::write(const HostPage& page) {
+    check_page_size(page, page_bytes_);
     const bool reuse = !free_slots_.empty();
     if (!reuse && next_slot_.load() == checksums_.size()) {
         throw std::runtime_error("spill file slot budget exhausted");
@@ -222,6 +231,7 @@ std::size_t DiskStorage::write(const HostPage& page) {
 }
 
 void DiskStorage::read(std::size_t slot, HostPage& page) {
+    check_page_size(page, page_bytes_);
     const auto offset = file_offset(slot, page_bytes_);
     if (slot >= checksums_.size() || !checksums_[slot]) {
         throw std::runtime_error("spill slot has no live page");

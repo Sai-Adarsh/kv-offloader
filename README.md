@@ -41,6 +41,8 @@ The CUDA/NVMe command has not been run. Real serving requires a scheduler that i
 
 Tests exercise temporary-file spills, bounded slot reuse, queued retirement, old lease lifetime, and foreign-lease rejection. They truncate a page, force a read error, and flip one byte of a full page. A rejected promotion leaves the old hot page and the disk scratch slot available. The corruption case also verifies that retirement lets the slot hold valid data again. Direct I/O tests are opt-in.
 
+Hot and spill transfers require a host buffer of exactly one configured page. The size check runs before copying bytes, changing slot state, or updating corruption counters.
+
 ```sh
 cmake -S . -B build/coverage -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping" -DKV_TEST_DIRECT_IO=ON
