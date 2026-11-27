@@ -34,3 +34,21 @@ CUDA allocates the hot pool and uses one pinned staging buffer on a dedicated st
 The CUDA/NVMe command has not been run. Real serving requires a scheduler that issues prefetches early and switches to ready sequences while cold pages load. The demo's resident polls are cache lookups; there is no model dispatch or measurement of decode latency.
 
 [CUDA runtime memory transfers](https://docs.nvidia.com/cuda/cuda-runtime-api/cuda-runtime-api/group__CUDART__MEMORY.html)
+
+## Tests and coverage
+
+Tests verify real tempfile spills, bounded slot reuse, queued retirement, old lease lifetime, rejection of foreign leases, pressure recovery, and kernel-imposed short and failed writes. Direct I/O tests are opt-in. Enable them on a filesystem that supports the platform's direct I/O mode.
+
+```sh
+cmake -S . -B build/coverage -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping" -DKV_TEST_DIRECT_IO=ON
+cmake --build build/coverage -j
+profiles="$(mktemp -d)"
+LLVM_PROFILE_FILE="$profiles/%m-%p.profraw" ctest --test-dir build/coverage --output-on-failure
+xcrun llvm-profdata merge -sparse "$profiles"/*.profraw -o "$profiles/merged.profdata"
+xcrun llvm-cov report build/coverage/kv_offloader \
+  -object build/coverage/kv_cache_tests -instr-profile="$profiles/merged.profdata" \
+  --show-branch-summary main.cpp cache.cpp cache.hpp storage.cpp storage.hpp
+```
+
+On Linux, use `llvm-profdata` and `llvm-cov` from the same Clang toolchain without the `xcrun` prefix. The instrumented AppleClang CPU build with direct I/O enabled reported 588/610 lines (96.39%) and 156/192 branches (81.25%). Xcode llvm-cov emitted one function mapping mismatch warning. Remaining CPU gaps include diagnostic guards and rare I/O and allocation failures. The CUDA backend was not built on this host.
