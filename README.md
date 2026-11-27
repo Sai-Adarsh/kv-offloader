@@ -1,27 +1,36 @@
 # Hierarchical KV cache offloader
 
-A C++ cache spills fixed-size KV blocks from a hot pool to bounded host memory and then to a temporary file. A worker handles I/O and copies, and each prefetch returns a future. A resident lookup skips I/O. Its page lease pins the slot until the caller releases it. Keep the lease until the GPU work that uses the page completes.
+This C++ cache spills fixed-size KV blocks from a hot pool to bounded host RAM and then to a temporary file. A FIFO worker handles transfers and reclamation. `try_get` only looks up resident blocks. `prefetch` returns a future for the transfer, and the resulting page lease pins its slot until the caller releases it. Hold the lease until device work using the page has completed.
 
-## Run in host memory
+## Build and run
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ./build/kv_offloader /tmp
+./build/kv_offloader /tmp --disk-slots 4 --churn 256
 ```
 
-Both memory pools use DRAM. The demo inserts five blocks into two hot and two warm slots, then reads a resident block while the worker restores the oldest block from disk. It reports transfer counts, prefetch time, resident lookups during the restore, and a checksum over all restored bytes.
+The short demo restores and verifies one spilled block. The churn run fills two hot slots, two host slots, and three disk slots with 64-KiB pages. It exercises disk pressure and verifies an existing lease after retirement and retirement submitted behind a queued restore. It then cycles through 256 restore, checksum, retire, and insert operations.
+
+On Apple Silicon, the DRAM/DRAM/temporary-file run kept seven live blocks, reused 256 spill slots, and reached a logical file high-water size of 262,144 bytes against a 262,144-byte budget. The churn checksums matched. This run used buffered file I/O. These figures describe one cache workload, so use a real model trace before making statements about decode stalls or storage bandwidth.
+
+## Retirement and disk slots
+
+`retire(id)` takes effect in worker submission order. After it completes, the ID leaves the cache and subsequent lookups miss. Earlier prefetches may complete before retirement. A pre-existing hot lease still reads the same bytes and keeps its slot allocated until the final holder releases it. Use a distinct ID for each block generation if an older operation may still be in flight.
+
+The spill file reuses released slots and is bounded by `disk_slots × page_bytes`. The normal spill path keeps one slot available so that a full cache can restore a disk page without first overwriting it. A new insert that needs another normal spill returns pressure once the budget is full. When all physical hot slots have outstanding leases, an operation requiring a hot slot also returns pressure. File usage counts the highest successfully written offset, so reclaiming a slot can leave the file size unchanged.
 
 ## Run with CUDA VRAM and NVMe
 
 ```sh
 cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release -DENABLE_CUDA=ON
 cmake --build build-cuda -j
-./build-cuda/kv_offloader /mnt/nvme --gpu --direct
+./build-cuda/kv_offloader /mnt/nvme --gpu --direct --churn 256
 ```
 
-CUDA allocates the hot pool once and copies through a reusable pinned buffer on a dedicated nonblocking stream. For the spill file, Linux `--direct` requests `O_DIRECT` with aligned pages, and macOS requests `F_NOCACHE`. Use a directory on the NVMe volume with a filesystem that supports the requested mode. A failure in direct mode returns an error.
+CUDA allocates the hot pool and uses one pinned staging buffer on a dedicated stream. The worker synchronizes each copy before reusing the buffer. Linux `--direct` requests `O_DIRECT`, and macOS requests `F_NOCACHE`. Use a filesystem supporting the selected mode.
 
-The demo uses resident lookups as a stand-in for model dispatch. A model scheduler must issue prefetches early enough to cover transfers and run another ready sequence while a required block is cold. A restore can fail if every hot slot has an active lease.
+The CUDA/NVMe command has not been run. Real serving requires a scheduler that issues prefetches early and switches to ready sequences while cold pages load. The demo's resident polls are cache lookups; there is no model dispatch or measurement of decode latency.
 
-[CUDA runtime memory transfers](https://docs.nvidia.com/cuda/cuda-runtime-api/cuda_runtime_api/group__CUDART__MEMORY.html)
+[CUDA runtime memory transfers](https://docs.nvidia.com/cuda/cuda-runtime-api/cuda-runtime-api/group__CUDART__MEMORY.html)
