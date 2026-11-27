@@ -115,6 +115,11 @@ void HotStorage::release(std::size_t slot) {
     free_slots_.push_back(slot);
 }
 
+bool HotStorage::has_free_slot() {
+    const std::lock_guard guard(free_mutex_);
+    return !free_slots_.empty();
+}
+
 const std::byte* HotStorage::data(std::size_t slot) const {
     return base_ + slot * page_bytes_;
 }
@@ -147,8 +152,13 @@ void HotStorage::get(std::size_t slot, HostPage& host) {
 }
 
 DiskStorage::DiskStorage(const std::filesystem::path& directory, std::size_t page_bytes,
-                         bool direct)
-    : page_bytes_(page_bytes) {
+                         std::size_t slots, bool direct)
+    : page_bytes_(page_bytes), capacity_(slots) {
+    if (slots < 2 || page_bytes == 0) {
+        throw std::invalid_argument("the spill file needs at least two nonempty slots");
+    }
+    (void)file_offset(slots - 1, page_bytes);
+    free_slots_.reserve(slots);
     auto pattern = (directory / "kv-offloader-XXXXXX").string();
     fd_ = mkstemp(pattern.data());
     check_io(fd_, "create spill file");
@@ -175,7 +185,11 @@ DiskStorage::DiskStorage(const std::filesystem::path& directory, std::size_t pag
 DiskStorage::~DiskStorage() { close(fd_); }
 
 std::size_t DiskStorage::write(const HostPage& page) {
-    const auto slot = free_slots_.empty() ? next_slot_ : free_slots_.back();
+    const bool reuse = !free_slots_.empty();
+    if (!reuse && next_slot_.load() == capacity_) {
+        throw std::runtime_error("spill file slot budget exhausted");
+    }
+    const auto slot = reuse ? free_slots_.back() : next_slot_.load();
     const auto offset = file_offset(slot, page_bytes_);
     ssize_t count = 0;
     do {
@@ -191,6 +205,7 @@ std::size_t DiskStorage::write(const HostPage& page) {
         ++next_slot_;
     } else {
         free_slots_.pop_back();
+        ++reused_writes_;
     }
     return slot;
 }

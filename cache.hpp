@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <deque>
 #include <future>
+#include <list>
 #include <map>
 #include <thread>
 #include <utility>
@@ -20,7 +21,7 @@ public:
         ~Page();
         Page(const Page&) = delete;
         Page& operator=(const Page&) = delete;
-        const std::byte* data() const { return storage_->data(slot_); }
+        const std::byte* data() const;
         std::size_t slot() const { return slot_; }
 
     private:
@@ -38,14 +39,21 @@ public:
         std::uint64_t host_to_disk;
         std::uint64_t disk_to_host;
         std::uint64_t host_to_hot;
+        std::uint64_t retired;
+        std::size_t disk_pages;
+        std::size_t disk_slot_reuses;
+        std::size_t disk_high_water_bytes;
     };
 
     KvCache(std::size_t hot_capacity, std::size_t host_capacity, std::size_t page_bytes,
-            const std::filesystem::path& spill_directory, bool gpu, bool direct);
+            const std::filesystem::path& spill_directory, bool gpu, bool direct,
+            std::size_t disk_slots = 64);
     ~KvCache();
 
     std::future<void> insert(BlockId id, std::vector<std::byte> payload);
     std::future<void> prefetch(BlockId id);
+    // Ordered after earlier worker jobs. Existing leases remain valid.
+    std::future<bool> retire(BlockId id);
     std::shared_ptr<const Page> try_get(BlockId id);
     std::future<std::uint64_t> checksum(std::shared_ptr<const Page> page);
     Stats stats() const;
@@ -69,13 +77,14 @@ private:
     }
 
     void run();
-    void spill_hot();
-    void spill_host();
-    void install(BlockId id, const HostPage& host);
+    void spill_hot(bool from_disk);
+    void spill_host(bool from_disk);
+    void install(BlockId id, const HostPage& host, bool from_disk = false);
 
     std::size_t hot_capacity_;
     std::size_t host_capacity_;
     std::size_t page_bytes_;
+    std::size_t disk_slots_;
     std::shared_ptr<HotStorage> hot_storage_;
     DiskStorage disk_storage_;
 
@@ -85,7 +94,7 @@ private:
 
     // Only the I/O worker touches these two tiers.
     std::map<BlockId, std::unique_ptr<HostPage>> host_;
-    std::deque<BlockId> host_age_;
+    std::list<BlockId> host_age_;
     std::map<BlockId, std::size_t> disk_;
 
     std::atomic_uint64_t hot_hits_{0};
@@ -94,6 +103,8 @@ private:
     std::atomic_uint64_t host_to_disk_{0};
     std::atomic_uint64_t disk_to_host_{0};
     std::atomic_uint64_t host_to_hot_{0};
+    std::atomic_uint64_t retired_{0};
+    std::atomic_size_t disk_pages_{0};
 
     std::mutex jobs_mutex_;
     std::condition_variable jobs_ready_;
