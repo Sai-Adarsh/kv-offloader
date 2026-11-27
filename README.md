@@ -37,7 +37,7 @@ The CUDA/NVMe command has not been run. Real serving requires a scheduler that i
 
 ## Tests and coverage
 
-Tests verify real tempfile spills, bounded slot reuse, queued retirement, old lease lifetime, rejection of foreign leases, pressure recovery, and kernel-imposed short and failed writes. Direct I/O tests are opt-in. Enable them on a filesystem that supports the platform's direct I/O mode.
+Tests exercise real temporary-file spills, bounded slot reuse, queued retirement, old lease lifetime, and foreign-lease rejection. They truncate a written spill page, force a read error, and verify a failed promotion leaves the old hot page and disk scratch available for retry. Direct I/O tests are opt-in. Enable them on a filesystem that supports the platform's direct I/O mode.
 
 ```sh
 cmake -S . -B build/coverage -DCMAKE_BUILD_TYPE=Debug \
@@ -51,4 +51,4 @@ xcrun llvm-cov report build/coverage/kv_offloader \
   --show-branch-summary main.cpp cache.cpp cache.hpp storage.cpp storage.hpp
 ```
 
-On Linux, use `llvm-profdata` and `llvm-cov` from the same Clang toolchain without the `xcrun` prefix. The instrumented AppleClang CPU build with direct I/O enabled reported 588/610 lines (96.39%) and 156/192 branches (81.25%). Xcode llvm-cov emitted one function mapping mismatch warning. Remaining CPU gaps include diagnostic guards and rare I/O and allocation failures. The CUDA backend was not built on this host.
+On Linux, use `llvm-profdata` and `llvm-cov` from the same Clang toolchain without the `xcrun` prefix. The instrumented AppleClang CPU build with direct I/O enabled covered 590/610 lines (96.72%) and 159/192 branches (82.81%). It covered all 120 instrumented lines in `storage.cpp`. Remaining CPU gaps include diagnostic guards and allocation rollback. The CUDA backend was not built on this host.

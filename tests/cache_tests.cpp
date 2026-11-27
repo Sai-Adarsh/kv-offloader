@@ -1,6 +1,8 @@
 #include "cache.hpp"
 
+#include <fcntl.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -92,27 +94,31 @@ void slot_budget(const std::filesystem::path& path) {
     rejects<std::system_error>([] { HostPage impossible(std::numeric_limits<std::size_t>::max()); }, "allocate host page");
 }
 
+class FileSizeLimit {
+public:
+    FileSizeLimit() {
+        require(getrlimit(RLIMIT_FSIZE, &saved_) == 0, "read file limit");
+        previous_ = std::signal(SIGXFSZ, SIG_IGN);
+        require(previous_ != SIG_ERR, "ignore file size signal");
+    }
+    ~FileSizeLimit() {
+        setrlimit(RLIMIT_FSIZE, &saved_);
+        std::signal(SIGXFSZ, previous_);
+    }
+    void use(rlim_t bytes) const {
+        auto adjusted = saved_;
+        adjusted.rlim_cur = bytes;
+        require(setrlimit(RLIMIT_FSIZE, &adjusted) == 0, "set file limit");
+    }
+
+private:
+    rlimit saved_{};
+    void (*previous_)(int) = nullptr;
+};
+
 void file_limit(const std::filesystem::path& path) {
     // The process limit forces real pwrite failures on the cache's unlinked file.
-    struct Limits {
-        rlimit saved{};
-        using Handler = void (*)(int);
-        Handler previous{};
-        Limits() {
-            require(getrlimit(RLIMIT_FSIZE, &saved) == 0, "read file limit");
-            previous = std::signal(SIGXFSZ, SIG_IGN);
-            require(previous != SIG_ERR, "ignore file size signal");
-        }
-        ~Limits() {
-            setrlimit(RLIMIT_FSIZE, &saved);
-            std::signal(SIGXFSZ, previous);
-        }
-        void use(rlim_t bytes) const {
-            auto adjusted = saved;
-            adjusted.rlim_cur = bytes;
-            require(setrlimit(RLIMIT_FSIZE, &adjusted) == 0, "set file limit");
-        }
-    } limit;
+    FileSizeLimit limit;
     HostPage page_data(bytes);
     std::fill(page_data.data(), page_data.data() + bytes, std::byte{7});
     DiskStorage disk(path, bytes, 2, false);
@@ -124,6 +130,72 @@ void file_limit(const std::filesystem::path& path) {
     require(disk.high_water_bytes() == 0, "short write consumed a slot");
     limit.use(bytes);
     require(disk.write(page_data) == 0, "corrected retry did not reclaim the first slot");
+}
+
+class ScopedFd {
+public:
+    explicit ScopedFd(int fd) : fd_(fd) { require(fd != -1, "open test descriptor"); }
+    ~ScopedFd() { close(fd_); }
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+    int get() const { return fd_; }
+
+private:
+    int fd_;
+};
+
+void unreadable_spill(const std::filesystem::path& path) {
+    // There are no cache worker threads yet. Reserve and release the next free
+    // descriptor so we can operate on the anonymous file without a production hook.
+    const ScopedFd write_only(open("/dev/null", O_WRONLY));
+    const auto fd = dup(write_only.get());
+    require(fd >= 0 && close(fd) == 0, "identify next temporary file descriptor");
+    DiskStorage disk(path, bytes, 2, false);
+    HostPage source(bytes), target(bytes);
+    std::fill(source.data(), source.data() + bytes, std::byte{11});
+    const auto slot = disk.write(source);
+    struct stat backing{};
+    require(fstat(fd, &backing) == 0 && S_ISREG(backing.st_mode) && backing.st_nlink == 0
+            && backing.st_size == bytes, "descriptor is not the anonymous spill file");
+
+    require(ftruncate(fd, bytes / 2) == 0, "truncate a written page");
+    rejects<std::runtime_error>([&] { disk.read(slot, target); }, "short read");
+
+    // Substitute a write-only descriptor briefly to make pread report EBADF.
+    const ScopedFd backup(dup(fd));
+    require(dup2(write_only.get(), fd) == fd, "install unreadable descriptor");
+    rejects<std::system_error>([&] { disk.read(slot, target); }, "read spill slot");
+    require(dup2(backup.get(), fd) == fd, "restore original backing descriptor");
+
+    disk.release(slot);
+    require(disk.write(source) == slot, "read failure prevented reclaiming the slot");
+    disk.read(slot, target);
+    require(std::equal(source.data(), source.data() + bytes, target.data()), "replacement page was corrupted");
+}
+
+void failed_spill_promotion(const std::filesystem::path& path) {
+    KvCache cache(1, 1, bytes, path, false, false, 2);
+    cache.insert(1, page(1)).get();
+    cache.insert(2, page(2)).get();
+    cache.insert(3, page(3)).get();
+    require(cache.stats().disk_pages == 1, "expected a full logical disk tier");
+    {
+        FileSizeLimit limit;
+        limit.use(bytes + bytes / 2);
+        rejects<std::runtime_error>([&] { cache.prefetch(1).get(); }, "short write");
+    }
+    require(cache.stats().disk_pages == 1 && cache.stats().disk_high_water_bytes == bytes,
+            "failed disk promotion consumed the scratch slot");
+    contents(cache.try_get(3), 3);
+    require(!cache.try_get(1), "failed promotion published data");
+    cache.prefetch(1).get();
+    contents(cache.try_get(1), 1);
+    require(cache.stats().disk_pages == 1 && cache.stats().disk_high_water_bytes == 2 * bytes,
+            "retry did not use the scratch slot once and reclaim the source");
+    cache.prefetch(2).get();
+    contents(cache.try_get(2), 2);
+    cache.prefetch(3).get();
+    contents(cache.try_get(3), 3);
 }
 
 void lifecycle(const std::filesystem::path& path) {
@@ -188,6 +260,8 @@ int main() try {
     TempDir temp;
     slot_budget(temp.path);
     file_limit(temp.path);
+    unreadable_spill(temp.path);
+    failed_spill_promotion(temp.path);
     lifecycle(temp.path);
     return 0;
 } catch (const std::exception& error) {

@@ -45,6 +45,8 @@ KvCache::Page::Page(std::shared_ptr<HotStorage> storage)
 
 KvCache::Page::~Page() { storage_->release(slot_); }
 
+const std::byte* KvCache::Page::data() const { return storage_->data(slot_); }
+
 KvCache::KvCache(std::size_t hot_capacity, std::size_t host_capacity, std::size_t page_bytes,
                  const std::filesystem::path& spill_directory, bool gpu, bool direct, std::size_t disk_slots)
     : hot_capacity_(nonzero(hot_capacity)), host_capacity_(nonzero(host_capacity)),

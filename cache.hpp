@@ -21,7 +21,7 @@ public:
         ~Page();
         Page(const Page&) = delete;
         Page& operator=(const Page&) = delete;
-        const std::byte* data() const { return storage_->data(slot_); }
+        const std::byte* data() const;
         std::size_t slot() const { return slot_; }
 
     private:
