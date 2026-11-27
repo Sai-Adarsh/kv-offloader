@@ -162,11 +162,13 @@ void unreadable_spill(const std::filesystem::path& path) {
 
     require(ftruncate(fd, bytes / 2) == 0, "truncate a written page");
     rejects<std::runtime_error>([&] { disk.read(slot, target); }, "short read");
+    require(disk.integrity_failures() == 1, "truncated live page was absent from integrity telemetry");
 
     // Substitute a write-only descriptor briefly to make pread report EBADF.
     const ScopedFd backup(dup(fd));
     require(dup2(write_only.get(), fd) == fd, "install unreadable descriptor");
     rejects<std::system_error>([&] { disk.read(slot, target); }, "read spill slot");
+    require(disk.integrity_failures() == 1, "system I/O failure was counted as corrupt bytes");
     require(dup2(backup.get(), fd) == fd, "restore original backing descriptor");
 
     disk.release(slot);
