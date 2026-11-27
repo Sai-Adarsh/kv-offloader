@@ -13,13 +13,15 @@ cmake --build build -j
 
 The short demo restores and verifies one spilled block. The churn run fills two hot slots, two host slots, and three disk slots with 64-KiB pages. It exercises disk pressure and verifies an existing lease after retirement and retirement submitted behind a queued restore. It then cycles through 256 restore, checksum, retire, and insert operations.
 
-On Apple Silicon, the DRAM/DRAM/temporary-file run kept seven live blocks, reused 256 spill slots, and reached a logical file high-water size of 262,144 bytes against a 262,144-byte budget. The churn checksums matched. This run used buffered file I/O. These figures describe one cache workload, so use a real model trace before making statements about decode stalls or storage bandwidth.
+On an Apple M3 Pro, the buffered run kept seven live blocks, reused 256 spill slots, and reached the 262,144-byte file budget. It reported zero integrity failures. The 256-cycle loop took 98.7 ms in this run, including fixture generation, checksums, and cache operations.
 
 ## Retirement and disk slots
 
 `retire(id)` takes effect in worker submission order. After it completes, the ID leaves the cache and subsequent lookups miss. Earlier prefetches may complete before retirement. A pre-existing hot lease still reads the same bytes and keeps its slot allocated until the final holder releases it. Use a distinct ID for each block generation if an older operation may still be in flight.
 
 The spill file reuses released slots and is bounded by `disk_slots × page_bytes`. The normal spill path keeps one slot available so that a full cache can restore a disk page without first overwriting it. The hot allocator reserves one extra physical page beyond its resident capacity to stage promotion before eviction. The worker copies the hot victim to host memory before consuming the disk scratch slot, and keeps the original disk page until it can publish the replacement. A failed copy or slot allocation therefore leaves the old page available and the disk scratch slot reusable. A new insert that needs another spill returns pressure once the normal budget is full. Outstanding leases can prevent eviction even after a block has been retired. File usage counts the highest successfully written offset, so reclaiming a slot can leave the file size unchanged.
+
+The worker records an in-memory FNV-1a checksum after a full disk write. A prefetch checks the bytes before eviction or publication. A short read or checksum mismatch fails the future and increments `disk_integrity_failures`. Read system-call errors propagate to the caller. The caller can retire the corrupt block and insert rebuilt KV bytes. The checksum adds one pass over each page on write and read and detects accidental corruption.
 
 ## Run with CUDA VRAM and NVMe
 
@@ -37,7 +39,7 @@ The CUDA/NVMe command has not been run. Real serving requires a scheduler that i
 
 ## Tests and coverage
 
-Tests exercise real temporary-file spills, bounded slot reuse, queued retirement, old lease lifetime, and foreign-lease rejection. They truncate a written spill page, force a read error, and verify a failed promotion leaves the old hot page and disk scratch available for retry. Direct I/O tests are opt-in. Enable them on a filesystem that supports the platform's direct I/O mode.
+Tests exercise temporary-file spills, bounded slot reuse, queued retirement, old lease lifetime, and foreign-lease rejection. They truncate a page, force a read error, and flip one byte of a full page. A rejected promotion leaves the old hot page and the disk scratch slot available. The corruption case also verifies that retirement lets the slot hold valid data again. Direct I/O tests are opt-in.
 
 ```sh
 cmake -S . -B build/coverage -DCMAKE_BUILD_TYPE=Debug \
@@ -51,4 +53,4 @@ xcrun llvm-cov report build/coverage/kv_offloader \
   --show-branch-summary main.cpp cache.cpp cache.hpp storage.cpp storage.hpp
 ```
 
-On Linux, use `llvm-profdata` and `llvm-cov` from the same Clang toolchain without the `xcrun` prefix. The instrumented AppleClang CPU build with direct I/O enabled covered 590/610 lines (96.72%) and 159/192 branches (82.81%). It covered all 120 instrumented lines in `storage.cpp`. Remaining CPU gaps include diagnostic guards and allocation rollback. The CUDA backend was not built on this host.
+On Linux, use `llvm-profdata` and `llvm-cov` from the same Clang toolchain without the `xcrun` prefix. The instrumented AppleClang CPU build with direct I/O enabled covered 599/619 lines (96.77%) and 166/200 branches (83.00%). It covered all 142 instrumented lines in `storage.cpp`. CUDA verification requires a separate build and an NVIDIA device.

@@ -31,13 +31,6 @@ std::size_t physical_hot_slots(std::size_t capacity) {
     return capacity + 1;
 }
 
-constexpr std::uint64_t checksum_start = 14695981039346656037ull;
-constexpr std::uint64_t checksum_prime = 1099511628211ull;
-
-std::uint64_t update_checksum(std::uint64_t sum, std::byte value) {
-    return (sum ^ std::to_integer<unsigned char>(value)) * checksum_prime;
-}
-
 }  // namespace
 
 KvCache::Page::Page(std::shared_ptr<HotStorage> storage)
@@ -189,17 +182,14 @@ std::future<std::uint64_t> KvCache::checksum(std::shared_ptr<const Page> page) {
     return submit<std::uint64_t>([this, page = std::move(page)] {
         HostPage host(page_bytes_);
         hot_storage_->get(page->slot(), host);
-        std::uint64_t sum = checksum_start;
-        for (std::size_t i = 0; i < page_bytes_; ++i) {
-            sum = update_checksum(sum, host.data()[i]);
-        }
-        return sum;
+        return page_checksum({host.data(), page_bytes_});
     });
 }
 
 KvCache::Stats KvCache::stats() const {
     return {hot_hits_, hot_misses_, hot_to_host_, host_to_disk_, disk_to_host_, host_to_hot_,
-            retired_, disk_pages_, disk_storage_.reused_writes(), disk_storage_.high_water_bytes()};
+            retired_, disk_pages_, disk_storage_.reused_writes(), disk_storage_.high_water_bytes(),
+            disk_storage_.integrity_failures()};
 }
 
 void KvCache::spill_hot(bool from_disk) {

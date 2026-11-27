@@ -75,7 +75,7 @@ void slot_budget(const std::filesystem::path& path) {
     require(hot.has_free_slot(), "released slot was not available");
 
     DiskStorage disk(path, bytes, 2, false);
-    rejects<std::runtime_error>([&] { disk.read(0, b); }, "short read");
+    rejects<std::runtime_error>([&] { disk.read(0, b); }, "no live page");
     const auto slot = disk.write(a);
     const auto second = disk.write(a);
     require(slot != second && disk.high_water_bytes() == 2 * bytes, "disk slot accounting");
@@ -83,6 +83,8 @@ void slot_budget(const std::filesystem::path& path) {
     disk.read(second, b);
     require(std::equal(a.data(), a.data() + bytes, b.data()), "disk storage copy");
     disk.release(slot);
+    rejects<std::runtime_error>([&] { disk.read(slot, b); }, "no live page");
+    rejects<std::logic_error>([&] { disk.release(slot); }, "inactive spill slot");
     require(disk.write(a) == slot && disk.reused_writes() == 1, "disk slot was not reused");
 
     rejects<std::runtime_error>([&] {
@@ -160,11 +162,13 @@ void unreadable_spill(const std::filesystem::path& path) {
 
     require(ftruncate(fd, bytes / 2) == 0, "truncate a written page");
     rejects<std::runtime_error>([&] { disk.read(slot, target); }, "short read");
+    require(disk.integrity_failures() == 1, "truncated live page was absent from integrity telemetry");
 
     // Substitute a write-only descriptor briefly to make pread report EBADF.
     const ScopedFd backup(dup(fd));
     require(dup2(write_only.get(), fd) == fd, "install unreadable descriptor");
     rejects<std::system_error>([&] { disk.read(slot, target); }, "read spill slot");
+    require(disk.integrity_failures() == 1, "system I/O failure was counted as corrupt bytes");
     require(dup2(backup.get(), fd) == fd, "restore original backing descriptor");
 
     disk.release(slot);
@@ -196,6 +200,36 @@ void failed_spill_promotion(const std::filesystem::path& path) {
     contents(cache.try_get(2), 2);
     cache.prefetch(3).get();
     contents(cache.try_get(3), 3);
+}
+
+void corrupted_spill_promotion(const std::filesystem::path& path) {
+    const auto fd = dup(STDERR_FILENO);
+    require(fd >= 0 && close(fd) == 0, "identify next spill file descriptor");
+    KvCache cache(1, 1, bytes, path, false, false, 2);
+    cache.insert(1, page(1)).get();
+    cache.insert(2, page(2)).get();
+    cache.insert(3, page(3)).get();
+    struct stat backing{};
+    require(fstat(fd, &backing) == 0 && S_ISREG(backing.st_mode) && backing.st_nlink == 0
+            && backing.st_size == bytes, "descriptor is not the cache spill file");
+    const std::byte altered{0x28};
+    require(pwrite(fd, &altered, sizeof(altered), bytes - 1) == sizeof(altered),
+            "change one byte in a live disk page");
+
+    rejects<std::runtime_error>([&] { cache.prefetch(1).get(); }, "spill page checksum mismatch at slot 0");
+    const auto failed = cache.stats();
+    require(failed.disk_integrity_failures == 1 && failed.disk_to_host == 0
+            && failed.disk_pages == 1 && failed.disk_high_water_bytes == bytes,
+            "corrupt prefetch changed tier accounting or consumed scratch");
+    require(!cache.try_get(1), "bad bytes became visible to a reader");
+    contents(cache.try_get(3), 3);
+
+    require(cache.retire(1).get(), "failed to retire corrupted disk block");
+    cache.insert(4, page(4)).get();
+    require(cache.stats().disk_slot_reuses == 1, "new spill did not replace corrupted slot");
+    cache.prefetch(2).get();
+    contents(cache.try_get(2), 2);
+    require(cache.stats().disk_integrity_failures == 1, "slot kept the old checksum when reused");
 }
 
 void lifecycle(const std::filesystem::path& path) {
@@ -262,6 +296,7 @@ int main() try {
     file_limit(temp.path);
     unreadable_spill(temp.path);
     failed_spill_promotion(temp.path);
+    corrupted_spill_promotion(temp.path);
     lifecycle(temp.path);
     return 0;
 } catch (const std::exception& error) {

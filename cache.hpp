@@ -43,6 +43,7 @@ public:
         std::size_t disk_pages;
         std::size_t disk_slot_reuses;
         std::size_t disk_high_water_bytes;
+        std::uint64_t disk_integrity_failures;
     };
 
     KvCache(std::size_t hot_capacity, std::size_t host_capacity, std::size_t page_bytes,
