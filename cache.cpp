@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -23,6 +24,13 @@ std::size_t checked_page_bytes(std::size_t bytes, std::size_t capacity) {
     return bytes;
 }
 
+std::size_t physical_hot_slots(std::size_t capacity) {
+    if (capacity == std::numeric_limits<std::size_t>::max()) {
+        throw std::invalid_argument("hot slot count leaves no room for a staging slot");
+    }
+    return capacity + 1;
+}
+
 constexpr std::uint64_t checksum_start = 14695981039346656037ull;
 constexpr std::uint64_t checksum_prime = 1099511628211ull;
 
@@ -40,8 +48,8 @@ KvCache::Page::~Page() { storage_->release(slot_); }
 KvCache::KvCache(std::size_t hot_capacity, std::size_t host_capacity, std::size_t page_bytes,
                  const std::filesystem::path& spill_directory, bool gpu, bool direct, std::size_t disk_slots)
     : hot_capacity_(nonzero(hot_capacity)), host_capacity_(nonzero(host_capacity)),
-      page_bytes_(checked_page_bytes(page_bytes, hot_capacity_)), disk_slots_(disk_slots),
-      hot_storage_(std::make_shared<HotStorage>(hot_capacity_, page_bytes_, gpu)),
+      page_bytes_(checked_page_bytes(page_bytes, physical_hot_slots(hot_capacity_))), disk_slots_(disk_slots),
+      hot_storage_(std::make_shared<HotStorage>(physical_hot_slots(hot_capacity_), page_bytes_, gpu)),
       disk_storage_(spill_directory, page_bytes_, disk_slots_, direct), worker_([this] { run(); }) {}
 
 KvCache::~KvCache() {
@@ -99,12 +107,15 @@ std::future<void> KvCache::prefetch(BlockId id) {
         if (const auto resident = host_.find(id); resident != host_.end()) {
             // The incoming block is already holding one host page. Remove it from
             // the eviction queue while making a slot for the incoming block.
+            const auto position = std::find(host_age_.begin(), host_age_.end(), id);
+            const auto next = std::next(position);
+            std::list<BlockId> detached;
+            detached.splice(detached.end(), host_age_, position);
             auto page = host_.extract(resident);
-            host_age_.erase(std::find(host_age_.begin(), host_age_.end(), id));
             try {
                 install(id, *page.mapped());
             } catch (...) {
-                host_age_.push_front(id);
+                host_age_.splice(next, detached, detached.begin());
                 host_.insert(std::move(page));
                 throw;
             }
@@ -170,6 +181,9 @@ std::future<std::uint64_t> KvCache::checksum(std::shared_ptr<const Page> page) {
     if (!page) {
         throw std::invalid_argument("checksum requires a resident block lease");
     }
+    if (page->storage_ != hot_storage_) {
+        throw std::invalid_argument("checksum requires a lease from this cache");
+    }
     return submit<std::uint64_t>([this, page = std::move(page)] {
         HostPage host(page_bytes_);
         hot_storage_->get(page->slot(), host);
@@ -208,12 +222,18 @@ void KvCache::spill_hot(bool from_disk) {
     }
 
     try {
-        spill_host(from_disk);
         auto page = std::make_unique<HostPage>(page_bytes_);
         hot_storage_->get(victim.mapped().page->slot(), *page);
         host_age_.push_back(victim.key());
         try {
             host_.try_emplace(victim.key(), std::move(page));
+            try {
+                // Keep the old warm page until its disk copy and index exist.
+                spill_host(from_disk);
+            } catch (...) {
+                host_.erase(victim.key());
+                throw;
+            }
         } catch (...) {
             host_age_.pop_back();
             throw;
@@ -227,7 +247,7 @@ void KvCache::spill_hot(bool from_disk) {
 }
 
 void KvCache::spill_host(bool from_disk) {
-    if (host_.size() < host_capacity_) {
+    if (host_.size() <= host_capacity_) {
         return;
     }
     if (!from_disk && disk_.size() >= disk_slots_ - 1) {
@@ -248,10 +268,16 @@ void KvCache::spill_host(bool from_disk) {
 }
 
 void KvCache::install(BlockId id, const HostPage& host, bool from_disk) {
-    spill_hot(from_disk);
+    // Commit only after copying into a separate slot. A failed upload or
+    // allocation cannot consume disk scratch or overwrite an existing page.
     std::shared_ptr<const Page> page(new Page(hot_storage_));
     hot_storage_->put(page->slot(), host);
+    std::map<BlockId, HotEntry> staging;
+    staging.try_emplace(id, HotEntry{std::move(page), 0});
+    auto replacement = staging.extract(staging.begin());
+    spill_hot(from_disk);
     const std::lock_guard guard(hot_mutex_);
-    hot_.try_emplace(id, HotEntry{std::move(page), ++clock_});
+    replacement.mapped().last_used = ++clock_;
+    hot_.insert(std::move(replacement));
     ++host_to_hot_;
 }

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <deque>
 #include <future>
+#include <list>
 #include <map>
 #include <thread>
 #include <utility>
@@ -93,7 +94,7 @@ private:
 
     // Only the I/O worker touches these two tiers.
     std::map<BlockId, std::unique_ptr<HostPage>> host_;
-    std::deque<BlockId> host_age_;
+    std::list<BlockId> host_age_;
     std::map<BlockId, std::size_t> disk_;
 
     std::atomic_uint64_t hot_hits_{0};
