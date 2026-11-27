@@ -96,6 +96,34 @@ void slot_budget(const std::filesystem::path& path) {
     rejects<std::system_error>([] { HostPage impossible(std::numeric_limits<std::size_t>::max()); }, "allocate host page");
 }
 
+void mismatched_transfer_pages(const std::filesystem::path& path) {
+    HostPage valid(bytes), result(bytes), wrong(bytes + 1);
+    std::fill_n(valid.data(), bytes, std::byte{11});
+    std::fill_n(wrong.data(), bytes + 1, std::byte{22});
+
+    HotStorage hot(1, bytes, false);
+    const auto hot_slot = hot.claim();
+    hot.put(hot_slot, valid);
+    rejects<std::invalid_argument>([&] { hot.put(hot_slot, wrong); }, "host page size");
+    rejects<std::invalid_argument>([&] { hot.get(hot_slot, wrong); }, "host page size");
+    hot.get(hot_slot, result);
+    require(std::equal(valid.data(), valid.data() + bytes, result.data()),
+            "invalid transfer changed the hot page");
+
+    DiskStorage disk(path, bytes, 2, false);
+    rejects<std::invalid_argument>([&] { disk.write(wrong); }, "host page size");
+    require(disk.high_water_bytes() == 0, "invalid spill consumed a slot");
+    const auto disk_slot = disk.write(valid);
+    rejects<std::invalid_argument>([&] { disk.read(disk_slot, wrong); }, "host page size");
+    require(std::all_of(wrong.data(), wrong.data() + bytes + 1, [](std::byte value) {
+        return value == std::byte{22};
+    }), "invalid transfer wrote into the caller's buffer");
+    require(disk.integrity_failures() == 0, "caller size error counted as spill corruption");
+    disk.read(disk_slot, result);
+    require(std::equal(valid.data(), valid.data() + bytes, result.data()),
+            "invalid transfer changed the disk page");
+}
+
 class FileSizeLimit {
 public:
     FileSizeLimit() {
@@ -293,6 +321,7 @@ void lifecycle(const std::filesystem::path& path) {
 int main() try {
     TempDir temp;
     slot_budget(temp.path);
+    mismatched_transfer_pages(temp.path);
     file_limit(temp.path);
     unreadable_spill(temp.path);
     failed_spill_promotion(temp.path);
