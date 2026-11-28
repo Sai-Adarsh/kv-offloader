@@ -7,6 +7,11 @@ function(check expected pattern)
 endfunction()
 
 check(1 "usage:")
+execute_process(COMMAND "${PROGRAM}" "" WORKING_DIRECTORY "${STATE_DIR}"
+    RESULT_VARIABLE empty_directory_result ERROR_VARIABLE empty_directory_error)
+if(NOT empty_directory_result STREQUAL "1" OR NOT empty_directory_error MATCHES "spill directory must not be empty")
+    message(FATAL_ERROR "Expected an empty spill directory to be rejected: ${empty_directory_error}")
+endif()
 check(1 "unknown kv_offloader flag" "${STATE_DIR}" --bad)
 check(1 "numeric option outside" "${STATE_DIR}" --disk-slots 1)
 check(1 "numeric option outside" "${STATE_DIR}" --churn 1x)
