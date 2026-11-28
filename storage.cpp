@@ -197,6 +197,9 @@ void HotStorage::get(std::size_t slot, HostPage& host) {
 DiskStorage::DiskStorage(const std::filesystem::path& directory, std::size_t page_bytes,
                          std::size_t slots, bool direct)
     : page_bytes_(page_bytes) {
+    if (directory.empty()) {
+        throw std::invalid_argument("spill directory must not be empty");
+    }
     if (slots < 2 || page_bytes == 0) {
         throw std::invalid_argument("the spill file needs at least two nonempty slots");
     }
